@@ -57,14 +57,19 @@ class FAN(keras.Model):
         self.n_z = len(self.sub_model.output)
         self.infer_ratios()
         self.setup_layers()
+        self.sub_model.trainable = False
     
     def setup_layers(self):
-        self.latent_space_encoder = keras.layers.Conv2D(
-            self.n_features,1)
+        self.latent_space_encoder = keras.Sequential()
+        self.latent_space_encoder.add(keras.layers.Conv2D(
+            self.n_features,1))
+        self.latent_space_encoder.add(keras.layers.Activation('tanh'))
         self.linear_layers = {
             'fan_'+str(i): FANLayer(self.n_features,ratio) 
             for i,ratio in zip(range(self.n_z),self.ratios[-1::-1])}
-        self.latent_space_decoder = keras.layers.Conv2D(3,1)
+        self.latent_space_decoder = keras.Sequential()
+        self.latent_space_decoder.add(keras.layers.Conv2D(3,1))
+        self.latent_space_decoder.add(keras.layers.Activation('sigmoid'))
         
     def infer_ratios(self):
         tmp = tf.ones([1,self.input_height,self.input_width,3])
@@ -133,19 +138,86 @@ class Flipper(keras.layers.Layer):
             x = tf.image.flip_up_down(x)
         return x
 
+class ImageCallBack(keras.callbacks.Callback):
+    def __init__(self,save_every_n,tf_dataset,log_dir):
+        super(ImageCallBack, self).__init__()
+        self.save_every_n = save_every_n
+        self.tf_dataset = iter(tf_dataset)
+        self.log_dir = log_dir
+        self.writer = tf.summary.create_file_writer(self.log_dir)
+        self.count = 0
+
+    def on_train_batch_end(self, batch, logs=None):
+        if self.count % self.save_every_n == 0:
+            batch = next(self.tf_dataset)
+            y_true,y_augmented = batch
+            prediction = self.model.predict(y_augmented)
+            with self.writer.as_default():
+                tf.summary.image("InputImage",y_augmented,self.count)
+                tf.summary.image("GroundTruth",y_true,self.count)
+                tf.summary.image("Prediction",prediction,self.count)
+                tf.summary.scalar("Loss",logs['loss'],self.count)
+                tf.summary.scalar("MAE",logs['mean_absolute_error'],self.count)
+        self.count += 1
+
 class DataGenerator:
-    def __init__(self,image_folder_path,transform=None):
+    def __init__(self,image_folder_path,shuffle=True,transform=None):
         self.image_folder_path = image_folder_path
         self.image_paths = glob('{}/*'.format(self.image_folder_path))
-        self.n_images = len(self.image_paths)
+        self.shuffle = shuffle
         self.transform = transform
+        self.n_images = len(self.image_paths)
     
-    def generate(self):
+    def generate(self,with_path=False):
         image_idx = [x for x in range(len(self.image_paths))]
-        np.random.shuffle(image_idx)
+        if self.shuffle == True:
+            np.random.shuffle(image_idx)
         for idx in image_idx:
-            x = np.array(Image.open(self.image_paths[idx]))[:,:,:3]
+            P = self.image_paths[idx]
+            x = np.array(Image.open(P))[:,:,:3]
             x = tf.convert_to_tensor(x) / 255
             if self.transform is not None:
                 x = self.transform(x)
-            yield x
+            if with_path == True:
+                yield x,P
+            else:
+                yield x
+
+class LargeImage:
+    def __init__(self,image,tile_size=[512,512],
+                 output_channels=3,offset=0):
+        """
+        Class facilitating the prediction for large images by 
+        performing all the necessary operations - tiling and 
+        reconstructing the output.
+        """
+        self.image = image
+        self.tile_size = tile_size
+        self.output_channels = output_channels
+        self.offset = offset
+        self.h = self.tile_size[0]
+        self.w = self.tile_size[1]
+        self.sh = self.image.shape[:2]
+        self.output = np.zeros([self.sh[0],self.sh[1],self.output_channels])
+        self.denominator = np.zeros([self.sh[0],self.sh[1],1])
+
+    def tile_image(self):
+        for x in range(0,self.sh[0],self.h):
+            x = x - self.offset
+            if x + self.tile_size[0] > self.sh[0]:
+                x = self.sh[0] - self.tile_size[0]
+            for y in range(0,self.sh[1],self.w):
+                y = y - self.offset
+                if y + self.tile_size[1] > self.sh[1]:
+                    y = self.sh[1] - self.tile_size[1]
+                x_1,x_2 = x, x+self.h
+                y_1,y_2 = y, y+self.w
+                yield self.image[x_1:x_2,y_1:y_2,:],((x_1,x_2),(y_1,y_2))
+
+    def update_output(self,image,coords):
+        (x_1,x_2),(y_1,y_2) = coords
+        self.output[x_1:x_2,y_1:y_2,:] += image
+        self.denominator[x_1:x_2,y_1:y_2,:] += 1
+
+    def return_output(self):
+        return self.output/self.denominator

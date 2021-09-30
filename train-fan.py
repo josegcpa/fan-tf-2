@@ -5,29 +5,6 @@ from tensorflow import keras
 
 from fan_utilities import *
 
-class ImageCallBack(keras.callbacks.Callback):
-    def __init__(self,save_every_n,tf_dataset,log_dir):
-        super(ImageCallBack, self).__init__()
-        self.save_every_n = save_every_n
-        self.tf_dataset = tf_dataset
-        self.log_dir = log_dir
-        self.writer = tf.summary.create_file_writer(self.log_dir)
-        self.count = 0
-
-    def on_train_batch_end(self, batch, logs=None):
-        if self.count % self.save_every_n == 0:
-            batch = next(iter(tf_dataset.take(1)))
-            y_true,y_augmented = batch
-            prediction = self.model.predict(y_augmented)
-            with self.writer.as_default():
-                tf.summary.image("InputImage",y_augmented,self.count)
-                tf.summary.image("GroundTruth",y_true,self.count)
-                tf.summary.image("Prediction",prediction,self.count)
-                tf.summary.scalar("Loss",logs['loss'],self.count)
-                tf.summary.scalar("MAE",logs['mean_absolute_error'],self.count)
-                tf.summary.scalar("MSE",logs['mean_squared_error'],self.count)
-        self.count += 1
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Trains a feature-aware normalization   model.')
 
@@ -46,7 +23,6 @@ if __name__ == "__main__":
     parser.add_argument('--n_features',dest = 'n_features',
                         action = 'store',type = int,default = 16,
                         help = 'Features for the latent space.')
-
 
     parser.add_argument('--log_every_n_steps',dest = 'log_every_n_steps',
                         action = 'store',type = int,default = 100,
@@ -88,8 +64,8 @@ if __name__ == "__main__":
 
     print("Setting up network...")
     mobilenet_v2 = keras.applications.MobileNetV2(include_top=False)
-    output_layer_ids = ['block_3_depthwise','block_6_depthwise',
-                        'block_8_depthwise']
+    output_layer_ids = ['block_3_depthwise','block_5_depthwise',
+                        'block_7_depthwise','block_9_depthwise']
     sub_model = keras.Model(
         inputs=mobilenet_v2.input,
         outputs=[mobilenet_v2.get_layer(x).output for x in output_layer_ids])
@@ -116,13 +92,13 @@ if __name__ == "__main__":
 
     print("Setting up training...")
     mae = tf.keras.metrics.MeanAbsoluteError()
-    mse = tf.keras.metrics.MeanSquaredError()
     loss_fn = keras.losses.MeanSquaredError()
     fan_model.compile(
-        optimizer=keras.optimizers.Adamax(learning_rate=args.learning_rate),
-        loss=loss_fn, metrics=[mae,mse])
+        optimizer=keras.optimizers.Adam(learning_rate=args.learning_rate),
+        loss=loss_fn, metrics=[mae])
+    fan_model.build(input_shape=(None,args.input_height,args.input_width,3))
     steps_per_epoch = data_generator.n_images // args.batch_size
-    
+
     print("Training...")
     tensorboard_callback = keras.callbacks.TensorBoard(
         log_dir=args.save_summary_folder)
@@ -134,8 +110,7 @@ if __name__ == "__main__":
         'loss',min_lr=1e-6)
 
     all_callbacks = [
-        tensorboard_callback,image_callback,checkpoint_callback,
-        lr_callback]
+        tensorboard_callback,image_callback,checkpoint_callback,lr_callback]
 
     fan_model.fit(
         x=tf_dataset,batch_size=args.batch_size,epochs=args.number_of_epochs,
