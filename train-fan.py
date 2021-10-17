@@ -6,10 +6,13 @@ from tensorflow import keras
 from fan_utilities import *
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Trains a feature-aware normalization   model.')
+    parser = argparse.ArgumentParser(description='Trains a feature-aware normalization model.')
 
     parser.add_argument('--dataset_path',dest='dataset_path',
                         action='store',type=str,default=None)
+    parser.add_argument('--hdf5',dest = 'hdf5',
+                        action = 'store_true',
+                        help = 'The dataset is a HDF5 file.')
     parser.add_argument('--padding',dest = 'padding',
                         action = 'store',default = 'VALID',
                         help = 'Define padding.',
@@ -23,6 +26,9 @@ if __name__ == "__main__":
     parser.add_argument('--n_features',dest = 'n_features',
                         action = 'store',type = int,default = 16,
                         help = 'Features for the latent space.')
+    parser.add_argument('--upscaling',dest = 'upscaling',
+                        action = 'store',type = str,default = 'standard',
+                        help = 'Type of upscaling (standard or transpose).')
 
     parser.add_argument('--log_every_n_steps',dest = 'log_every_n_steps',
                         action = 'store',type = int,default = 100,
@@ -50,7 +56,7 @@ if __name__ == "__main__":
         ['hue_max_delta',0.2,float],
         ['contrast_lower',0.8,float],['contrast_upper',1.2,float]]:
         parser.add_argument('--{}'.format(arg[0]),dest=arg[0],
-                            action='store',type=arg[2],default=arg[1])    
+                            action='store',type=arg[2],default=arg[1])
 
     args = parser.parse_args()
 
@@ -60,22 +66,26 @@ if __name__ == "__main__":
         'saturation_upper':args.saturation_upper,
         'hue_delta':args.hue_max_delta,
         'contrast_lower':args.contrast_lower,
-        'contrast_upper':args.contrast_upper}
+        'contrast_upper':args.contrast_upper,
+        'probability':1}
 
     print("Setting up network...")
     mobilenet_v2 = keras.applications.MobileNetV2(include_top=False)
-    output_layer_ids = ['block_3_depthwise','block_5_depthwise',
-                        'block_7_depthwise','block_9_depthwise']
     sub_model = keras.Model(
         inputs=mobilenet_v2.input,
         outputs=[mobilenet_v2.get_layer(x).output for x in output_layer_ids])
     fan_model = FAN(sub_model,args.n_features,
-                    args.input_height,args.input_width)
+                    args.input_height,args.input_width,
+                    batch_size=args.batch_size,
+                    upscaling=args.upscaling)
 
     print("Setting up data generator...")
     flipper = Flipper()
-    colour_augmenter = ColourAugmentation(**data_augmentation_params )
-    data_generator = DataGenerator(args.dataset_path,flipper)
+    colour_augmenter = ColourAugmentation(**data_augmentation_params)
+    if args.hdf5 == False:
+        data_generator = DataGenerator(args.dataset_path,flipper)
+    else:
+        data_generator = DataGeneratorHDF5(args.dataset_path,flipper)
     def load_generator():
         for image in data_generator.generate():
             yield colour_augmenter(image),image
@@ -96,7 +106,7 @@ if __name__ == "__main__":
     fan_model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=args.learning_rate),
         loss=loss_fn, metrics=[mae])
-    fan_model.build(input_shape=(None,args.input_height,args.input_width,3))
+    fan_model.build(input_shape=(args.batch_size,args.input_height,args.input_width,3))
     steps_per_epoch = data_generator.n_images // args.batch_size
 
     print("Training...")
@@ -105,7 +115,7 @@ if __name__ == "__main__":
     image_callback = ImageCallBack(
         args.log_every_n_steps,tf_dataset,log_dir=args.save_summary_folder)
     checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-        args.save_checkpoint_folder)
+        args.save_checkpoint_folder + '-{epoch:02d}')
     lr_callback = tf.keras.callbacks.ReduceLROnPlateau(
         'loss',min_lr=1e-6)
 

@@ -1,11 +1,43 @@
 import os
 import numpy as np
-from math import inf
+import h5py
 from PIL import Image
 from glob import glob
 
 import tensorflow as tf
 from tensorflow import keras
+
+output_layer_ids = ['block_1_expand','block_3_expand',
+                    'block_5_expand','block_7_expand']
+
+class InvertibleConv2D(keras.layers.Layer):
+    def __init__(self,n_input_features,n_output_features,batch_size):
+        super(InvertibleConv2D,self).__init__()
+        self.n_input_features = n_input_features
+        self.n_output_features = n_output_features
+        self.batch_size = batch_size
+        self.w_shape = (1,1,self.n_input_features,self.n_output_features)
+        self.init = keras.initializers.GlorotUniform()
+        self.W = tf.Variable(self.init(self.w_shape))
+
+    def encode(self,x):
+        sh = x.shape.as_list()
+        return tf.nn.conv2d(x,self.W,[1,1],'SAME')
+    
+    def decode(self,x):
+        sh = x.shape.as_list()
+        return tf.nn.conv2d_transpose(
+            x,self.W,[self.batch_size,sh[1],sh[2],self.n_input_features],
+            strides=[1,1])
+    
+    def update_batch_size(self,batch_size):
+        self.batch_size = batch_size
+
+    def call(self,x):
+        if x.shape[-1] == self.n_input_features:
+            return self.encode(x)
+        else:
+            return self.decode(x)
 
 class FANLayer(keras.layers.Layer):
     def __init__(self,n_features,ratio,epsilon=1e-8,
@@ -31,11 +63,13 @@ class FANLayer(keras.layers.Layer):
             self.relu.add(keras.layers.UpSampling2D(self.ratio))
         elif self.upscaling == 'transpose':
             self.sigmoid.add(
-                keras.layers.Conv2D(self.n_features,self.ratio,padding='same',
-                                    strides=self.ratio))
+                keras.layers.Conv2DTranspose(
+                    self.n_features,self.ratio,padding='same',
+                    strides=self.ratio))
             self.relu.add(
-                keras.layers.Conv2D(self.n_features,self.ratio,padding='same',
-                                    strides=self.ratio))
+                keras.layers.Conv2DTranspose(
+                    self.n_features,self.ratio,padding='same',
+                    strides=self.ratio))
     
     def call(self,x,z):
         mean_x = tf.reduce_mean(x,axis=[1,2],keepdims=True)
@@ -47,29 +81,27 @@ class FANLayer(keras.layers.Layer):
 
 class FAN(keras.Model):
     def __init__(self,sub_model,n_features,
-                 input_height,input_width,epsilon=1e-8):
+                 input_height,input_width,epsilon=1e-8,
+                 batch_size=1,upscaling='standard'):
         super(FAN,self).__init__()
         self.n_features = n_features
         self.epsilon = epsilon
         self.sub_model = sub_model
         self.input_height = input_height
         self.input_width = input_width
+        self.batch_size = batch_size
+        self.upscaling = upscaling
         self.n_z = len(self.sub_model.output)
         self.infer_ratios()
         self.setup_layers()
-        self.sub_model.trainable = False
     
     def setup_layers(self):
-        self.latent_space_encoder = keras.Sequential()
-        self.latent_space_encoder.add(keras.layers.Conv2D(
-            self.n_features,1))
-        self.latent_space_encoder.add(keras.layers.Activation('tanh'))
+        self.encoder_decoder = InvertibleConv2D(
+            3,self.n_features,self.batch_size)
         self.linear_layers = {
-            'fan_'+str(i): FANLayer(self.n_features,ratio) 
+            'fan_'+str(i): FANLayer(
+                self.n_features,ratio,upscaling=self.upscaling) 
             for i,ratio in zip(range(self.n_z),self.ratios[-1::-1])}
-        self.latent_space_decoder = keras.Sequential()
-        self.latent_space_decoder.add(keras.layers.Conv2D(3,1))
-        self.latent_space_decoder.add(keras.layers.Activation('sigmoid'))
         
     def infer_ratios(self):
         tmp = tf.ones([1,self.input_height,self.input_width,3])
@@ -77,12 +109,12 @@ class FAN(keras.Model):
         self.ratios = [self.input_height//x.shape[1] for x in outs]
 
     def call(self,x):
-        feature_space = self.latent_space_encoder(x)
+        feature_space = self.encoder_decoder.encode(x)
         zs = self.sub_model(x)
         tr = feature_space
         for lin,z in zip(self.linear_layers,zs[-1::-1]):
             tr = self.linear_layers[lin](tr,z)
-        return self.latent_space_decoder(tr)
+        return self.encoder_decoder.decode(tr)
 
 class ColourAugmentation(keras.layers.Layer):
     def __init__(self,
@@ -150,12 +182,12 @@ class ImageCallBack(keras.callbacks.Callback):
     def on_train_batch_end(self, batch, logs=None):
         if self.count % self.save_every_n == 0:
             batch = next(self.tf_dataset)
-            y_true,y_augmented = batch
+            y_augmented,y_true = batch
             prediction = self.model.predict(y_augmented)
             with self.writer.as_default():
-                tf.summary.image("InputImage",y_augmented,self.count)
-                tf.summary.image("GroundTruth",y_true,self.count)
-                tf.summary.image("Prediction",prediction,self.count)
+                tf.summary.image("0:InputImage",y_augmented,self.count)
+                tf.summary.image("1:GroundTruth",y_true,self.count)
+                tf.summary.image("2:Prediction",prediction,self.count)
                 tf.summary.scalar("Loss",logs['loss'],self.count)
                 tf.summary.scalar("MAE",logs['mean_absolute_error'],self.count)
         self.count += 1
@@ -175,6 +207,30 @@ class DataGenerator:
         for idx in image_idx:
             P = self.image_paths[idx]
             x = np.array(Image.open(P))[:,:,:3]
+            x = tf.convert_to_tensor(x) / 255
+            if self.transform is not None:
+                x = self.transform(x)
+            if with_path == True:
+                yield x,P
+            else:
+                yield x
+
+class DataGeneratorHDF5:
+    def __init__(self,hdf5_path,shuffle=True,transform=None):
+        self.hdf5_path = hdf5_path
+        self.h5 = h5py.File(self.hdf5_path,'r')
+        self.shuffle = shuffle
+        self.transform = transform
+        self.all_keys = list(self.h5.keys())
+        self.n_images = len(self.all_keys)
+    
+    def generate(self,with_path=False):
+        image_idx = [x for x in range(self.n_images)]
+        if self.shuffle == True:
+            np.random.shuffle(image_idx)
+        for idx in image_idx:
+            P = self.all_keys[idx]
+            x = self.h5[P]['image']
             x = tf.convert_to_tensor(x) / 255
             if self.transform is not None:
                 x = self.transform(x)
