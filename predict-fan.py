@@ -45,6 +45,12 @@ if __name__ == "__main__":
     parser.add_argument('--resize_size',dest='resize_size',
                         action='store',type=int,default=256,
                         help='Target size for images.')
+    parser.add_argument('--fan_min',dest='fan_min',
+                        action='store',type=float,default=None,
+                        help='Minimum for FAN.')
+    parser.add_argument('--fan_max',dest='fan_max',
+                        action='store',type=float,default=None,
+                        help='Maximum for FAN adjustment.')
 
     parser.add_argument('--checkpoint_path',dest='checkpoint_path',
                         action='store',type=str,default='checkpoints',
@@ -97,12 +103,18 @@ if __name__ == "__main__":
                 tile_tensor = tf.expand_dims(
                     tf.convert_to_tensor(tile),axis=0)
                 tile_prediction = fan_model.predict(tile_tensor)
+                tile_prediction = tile_prediction[0,:,:,:]
                 large_image.update_output(tile_prediction,coords)
             image_prediction = large_image.return_output()
         
-        image_prediction = image_prediction - image_prediction.min() / (image_prediction.max() - image_prediction.min())
-        
         if args.hdf5_output == False:
+            if args.fan_min is None or args.fan_max is None:
+                image_prediction = image_prediction - image_prediction.min() / (image_prediction.max() - image_prediction.min())
+            else:
+                m = args.fan_min
+                M = args.fan_max
+                image_prediction = (image_prediction-m)/(M-m)
+                image_prediction = np.clip(image_prediction,0,1)
             if args.example == True:
                 image_prediction = np.concatenate([image,image_prediction],axis=1)
 
@@ -110,6 +122,13 @@ if __name__ == "__main__":
             image_prediction.save(output_path)
         else:
             g = F.create_group(root)
+            image = np.uint8(image.numpy()*255)
+            if args.fan_min is not None and args.fan_max is not None:
+                m = args.fan_min
+                M = args.fan_max
+                image_prediction = (image_prediction-m)/(M-m)
+                image_prediction = np.clip(image_prediction,0,1)
+                image_prediction = np.uint8(image_prediction*255)
             g['image'] = image
             g['prediction'] = image_prediction
         pbar.update(1)
